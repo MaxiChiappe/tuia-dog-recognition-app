@@ -12,6 +12,7 @@ from lib.services.detection_service import DetectionService
 from lib.services.similarity_service import SimilarityService
 from lib.storage.base import EmbeddingStoreProtocol
 from lib.storage.embedding_store import EmbeddingStore
+from lib.training import TrainConfig
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def build_classifier(settings: Settings) -> ClassifierService:
         image_size=settings.image_size,
         dataset_path=settings.dataset_path,
         output_path=settings.output_path,
+        train_config=TrainConfig.from_settings(settings),
     )
 
 

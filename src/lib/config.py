@@ -41,6 +41,22 @@ class Settings(BaseSettings):
     yolo_conf_threshold: float = os.getenv("YOLO_CONF_THRESHOLD", 0.25)
     yolo_dog_class_id: int = os.getenv("YOLO_DOG_CLASS_ID", 16)
 
+    # Entrenamiento de los clasificadores (Etapa 2)
+    # CSV con columnas filepaths,labels,"data set" (rutas relativas a DATASET_PATH)
+    splits_file: Path = Path(os.getenv("SPLITS_FILE", "data/dataset/dogs.csv"))
+    train_epochs: int = os.getenv("TRAIN_EPOCHS", 10)
+    train_batch_size: int = os.getenv("TRAIN_BATCH_SIZE", 32)
+    train_lr: float = os.getenv("TRAIN_LR", 0.001)
+    train_weight_decay: float = os.getenv("TRAIN_WEIGHT_DECAY", 0.0001)
+    train_label_smoothing: float = os.getenv("TRAIN_LABEL_SMOOTHING", 0.1)
+    train_dropout: float = os.getenv("TRAIN_DROPOUT", 0.3)
+    train_patience: int = os.getenv("TRAIN_PATIENCE", 3)
+    train_seed: int = os.getenv("TRAIN_SEED", 42)
+    # Estrategia del Modelo A: head (backbone congelado) | layer4 (descongela el ultimo bloque)
+    resnet_finetune: str = os.getenv("RESNET_FINETUNE", "head")
+    # Maximo de imagenes por raza (0 = todas); util para pruebas rapidas
+    train_limit_per_class: int = os.getenv("TRAIN_LIMIT_PER_CLASS", 0)
+
     # Paths
     embeddings_path: Path = Path(os.getenv("EMBEDDINGS_PATH", "data/embeddings.json"))
     data_path: Path = Path(os.getenv("DATA_PATH", "data"))
