@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     yolo_dog_class_id: int = os.getenv("YOLO_DOG_CLASS_ID", 16)
 
     # Entrenamiento de los clasificadores (Etapa 2)
-    # CSV con columnas filepaths,labels,"data set" (rutas relativas a DATASET_PATH)
-    splits_file: Path = Path(os.getenv("SPLITS_FILE", "data/dataset/dogs.csv"))
+    # CSV de splits de 1-pre-processing.ipynb: filepaths,labels,"data set" (relativas a DATASET_PATH)
+    splits_file: Path = Path(os.getenv("SPLITS_FILE", "data/splits.csv"))
     train_epochs: int = os.getenv("TRAIN_EPOCHS", 10)
     train_batch_size: int = os.getenv("TRAIN_BATCH_SIZE", 32)
     train_lr: float = os.getenv("TRAIN_LR", 0.001)
