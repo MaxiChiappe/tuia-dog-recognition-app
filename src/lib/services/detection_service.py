@@ -7,8 +7,10 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
+from lib.preprocessing import preprocess_bgr
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
 
@@ -105,7 +107,13 @@ class DetectionService:
 
         El recorte llega en BGR (OpenCV). Retorna (raza, score).
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        model = self.classifier.get_torch_model()  # modelo activo, cacheado por load_model
+        tensor = preprocess_bgr(crop, self.classifier.image_size)  # mismo preprocesamiento
+        with torch.no_grad():
+            probs = torch.softmax(model(tensor), dim=1)[0]
+        score, idx = probs.max(dim=0)
+        # La lista de razas viaja dentro del modelo: indice -> nombre sin depender del dataset
+        return model.classes[int(idx)], float(score)
 
     # ------------------------------------------------------------------
     # Orquestacion provista
