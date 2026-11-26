@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import csv
 import json
 import logging
 import time
@@ -10,11 +12,13 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import onnxruntime
+from sklearn.metrics import confusion_matrix
 from torch import nn
 from torch.utils.data import DataLoader
 
+from lib.evaluation.metrics import precision_recall_f1, specificity
 from lib.models import BreedClassifier, build_cnn_custom_classifier, build_resnet18_classifier
-from lib.preprocessing import build_train_augmentation
+from lib.preprocessing import build_train_augmentation, preprocess_bgr
 from lib.training import DogDataset, TrainConfig, load_split, run_epoch, set_seed
 
 logger = logging.getLogger(__name__)
@@ -122,20 +126,27 @@ class ClassifierService:
             name, len(train_items), len(valid_items), len(classes),
         )
 
-        model = self._build_model(name, classes)
+        # GPU si esta disponible (ej. Colab); si no, CPU. El checkpoint se guarda siempre en CPU.
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_cuda = device.type == "cuda"
+        model = self._build_model(name, classes).to(device)
         trainable = [p for p in model.parameters() if p.requires_grad]
         logger.info(
-            "Trainable params: %d / %d",
-            sum(p.numel() for p in trainable), sum(p.numel() for p in model.parameters()),
+            "Trainable params: %d / %d | device: %s",
+            sum(p.numel() for p in trainable), sum(p.numel() for p in model.parameters()), device,
         )
 
+        # Con GPU, 2 procesos leen imagenes en paralelo para no frenarla; en CPU no hace falta.
+        loader_kwargs = {"num_workers": 2 if use_cuda else 0, "pin_memory": use_cuda}
         generator = torch.Generator().manual_seed(cfg.seed)
         train_loader = DataLoader(
             DogDataset(train_items, classes, self.image_size, build_train_augmentation(cfg.seed)),
             batch_size=cfg.batch_size, shuffle=True, drop_last=True, generator=generator,
+            **loader_kwargs,
         )
         valid_loader = DataLoader(
-            DogDataset(valid_items, classes, self.image_size), batch_size=cfg.batch_size
+            DogDataset(valid_items, classes, self.image_size), batch_size=cfg.batch_size,
+            **loader_kwargs,
         )
 
         criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
@@ -149,8 +160,8 @@ class ClassifierService:
 
         for epoch in range(1, cfg.epochs + 1):
             start = time.time()
-            train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer)
-            val_loss, val_acc = run_epoch(model, valid_loader, criterion)
+            train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_acc = run_epoch(model, valid_loader, criterion, device=device)
             scheduler.step()
             history.append({
                 "epoch": epoch, "train_loss": train_loss, "train_acc": train_acc,
@@ -164,7 +175,8 @@ class ClassifierService:
 
             if val_acc > best_acc:
                 best_acc, epochs_without_improvement = val_acc, 0
-                torch.save(model, checkpoint)  # modelo completo, como espera load_model
+                # modelo completo (como espera load_model) y en CPU, para que la app lo cargue sin GPU
+                torch.save(copy.deepcopy(model).to("cpu"), checkpoint)
                 logger.info("New best val acc %.4f -> saved %s", val_acc, checkpoint)
             else:
                 epochs_without_improvement += 1
@@ -216,7 +228,96 @@ class ClassifierService:
           {"accuracy": 0.91, "precision": 0.90, "recall": 0.89,
            "specificity": 0.99, "f1": 0.90}
         """
-        raise NotImplementedError("Etapa 2: implementar evaluate_classifier")
+        items = load_split(self.train_config.splits_file, self.dataset_path, "test")
+        if not items:
+            raise ValueError(f"Split test vacio en {self.train_config.splits_file}")
+        return self.evaluate_items(items, tag="test")
+
+    def evaluate_items(self, items: list[tuple[Path, str]], tag: str) -> dict[str, float]:
+        """Evalua el modelo activo sobre una lista de (ruta, raza): test o conjunto independiente.
+
+        Precision, recall, F1 y specificity se calculan por raza (one-vs-rest) y se promedian
+        (macro) sobre las razas presentes en `items`. Guarda las predicciones en
+        output/predictions_<modelo>_<tag>.csv para el analisis de errores en 2-train.ipynb.
+        """
+        model = self.get_torch_model()
+        classes = model.classes
+        missing = sorted({breed for _, breed in items if breed not in classes})
+        if missing:
+            raise ValueError(f"Razas que el modelo no conoce: {missing}")
+
+        loader = DataLoader(
+            DogDataset(items, classes, self.image_size), batch_size=self.train_config.batch_size
+        )
+        y_true: list[int] = []
+        y_pred: list[int] = []
+        scores: list[float] = []
+        with torch.no_grad():
+            for images, labels in loader:
+                probs = torch.softmax(model(images), dim=1)
+                score, pred = probs.max(dim=1)
+                y_true.extend(labels.tolist())
+                y_pred.extend(pred.tolist())
+                scores.extend(score.tolist())
+
+        metrics = self._classification_metrics(y_true, y_pred, len(classes))
+        self._save_predictions(tag, items, classes, y_true, y_pred, scores)
+        logger.info("[%s] metrics on %s: %s", self.active_model_name, tag, metrics)
+        return metrics
+
+    @staticmethod
+    def _classification_metrics(
+        y_true: list[int], y_pred: list[int], n_classes: int
+    ) -> dict[str, float]:
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+        total = int(cm.sum())
+        precisions, recalls, f1s, specificities = [], [], [], []
+        for c in sorted(set(y_true)):  # razas presentes en el conjunto evaluado
+            tp = int(cm[c, c])
+            fp = int(cm[:, c].sum()) - tp
+            fn = int(cm[c, :].sum()) - tp
+            tn = total - tp - fp - fn
+            p, r, f1 = precision_recall_f1(tp, fp, fn)
+            precisions.append(p)
+            recalls.append(r)
+            f1s.append(f1)
+            specificities.append(specificity(tn, fp))
+        return {
+            "accuracy": float(np.trace(cm) / total) if total else 0.0,
+            "precision": float(np.mean(precisions)),
+            "recall": float(np.mean(recalls)),
+            "specificity": float(np.mean(specificities)),
+            "f1": float(np.mean(f1s)),
+        }
+
+    def _save_predictions(
+        self,
+        tag: str,
+        items: list[tuple[Path, str]],
+        classes: list[str],
+        y_true: list[int],
+        y_pred: list[int],
+        scores: list[float],
+    ) -> None:
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        path = self.output_path / f"predictions_{self.active_model_name}_{tag}.csv"
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["path", "true", "pred", "score"])
+            for (image_path, _), t, p, s in zip(items, y_true, y_pred, scores):
+                writer.writerow([image_path.as_posix(), classes[t], classes[p], round(s, 6)])
+        logger.info("Predictions saved to %s", path)
+
+    def get_torch_model(self) -> BreedClassifier:
+        """Modelo activo (.pth) en modo evaluacion. Lo usan la evaluacion, los embeddings y la
+        clasificacion de la Etapa 3."""
+        model = self.load_model()
+        if not isinstance(model, nn.Module):
+            raise ValueError(
+                f"{self.active_checkpoint}: se esperaba un checkpoint .pth (modelo PyTorch completo)"
+            )
+        model.eval()
+        return model
 
     def extract_custom_embedding(self, image: np.ndarray) -> list[float]:
         """
@@ -228,4 +329,16 @@ class ClassifierService:
         La imagen llega en BGR (OpenCV). Retorna una lista de floats de
         dimension EMBEDDING_DIM.
         """
-        raise NotImplementedError("Etapa 2: implementar extract_custom_embedding")
+        model = self.get_torch_model()
+        tensor = preprocess_bgr(image, self.image_size)  # mismo preprocesamiento que al entrenar
+        with torch.no_grad():
+            embedding = model.embed(tensor).squeeze(0).numpy()
+        if embedding.shape[0] != self.train_config.embedding_dim:
+            raise ValueError(
+                f"El embedding de {self.active_model_name} tiene {embedding.shape[0]} dimensiones "
+                f"y EMBEDDING_DIM es {self.train_config.embedding_dim}"
+            )
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        return embedding.astype(float).tolist()

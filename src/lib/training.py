@@ -124,6 +124,7 @@ def run_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
 ) -> tuple[float, float]:
     """Una pasada sobre `loader`. Entrena si recibe optimizer; si no, solo evalúa.
 
@@ -137,6 +138,7 @@ def run_epoch(
     total_loss, correct, seen = 0.0, 0, 0
     with torch.set_grad_enabled(training):
         for images, labels in loader:
+            images, labels = images.to(device), labels.to(device)
             logits = model(images)
             loss = criterion(logits, labels)
             if training:
