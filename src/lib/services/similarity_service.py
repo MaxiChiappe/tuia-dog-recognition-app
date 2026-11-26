@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
+from torchvision import models
 
+from lib.preprocessing import preprocess_bgr
 from lib.schemas import EmbeddingRecord, Neighbor, SearchResult
 from lib.storage.base import EmbeddingStoreProtocol
 
@@ -72,7 +76,24 @@ class SimilarityService:
           - Recordar que la imagen llega en BGR (OpenCV).
         Retorna una lista de floats de dimension EMBEDDING_DIM.
         """
-        raise NotImplementedError("Etapa 1: implementar extract_embedding")
+        model = self._get_baseline_model()
+        tensor = preprocess_bgr(image, self.image_size)
+        with torch.no_grad():
+            features = model(tensor).squeeze(0).numpy()
+        norm = np.linalg.norm(features)
+        if norm > 0:
+            features = features / norm
+        return features.astype(float).tolist()
+
+    def _get_baseline_model(self) -> torch.nn.Module:
+        """ResNet18 preentrenada en ImageNet sin la capa fc (512 dims), cargada una sola vez."""
+        if getattr(self, "_baseline_model", None) is None:
+            logger.info("Loading baseline embedding model (ResNet18, ImageNet)")
+            model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+            model.fc = torch.nn.Identity()
+            model.eval()
+            self._baseline_model = model
+        return self._baseline_model
 
     def search_similar_images(self, embedding: list[float], top_k: int) -> list[Neighbor]:
         """
@@ -85,7 +106,19 @@ class SimilarityService:
         Retorna una lista de Neighbor (path, breed, score) ordenada por score
         descendente.
         """
-        raise NotImplementedError("Etapa 1: implementar search_similar_images")
+        # pgvector ordena por distancia coseno en la base. Con embeddings normalizados L2,
+        # ||a-b||^2 = 2 - 2*cos(a,b), así que ese orden también vale para l2.
+        if hasattr(self.store, "search"):
+            candidates = self.store.search(embedding, top_k)
+        else:
+            candidates = self.store.all()
+
+        neighbors = [
+            Neighbor(path=r.path, breed=r.breed, score=self.similarity(embedding, r.embedding))
+            for r in candidates
+        ]
+        neighbors.sort(key=lambda n: n.score, reverse=True)
+        return neighbors[:top_k]
 
     def predict_breed_from_neighbors(self, results: list[Neighbor]) -> tuple[str, float]:
         """
@@ -94,8 +127,19 @@ class SimilarityService:
 
         Si el mejor score esta por debajo de self.similarity_threshold se
         considera "unknown". Retorna (raza, score).
+
+        Voto ponderado: gana la raza con mayor suma de similitudes. El score devuelto
+        es la similitud media de los vecinos de la raza ganadora.
         """
-        raise NotImplementedError("Etapa 1: implementar predict_breed_from_neighbors")
+        if not results or max(n.score for n in results) < self.similarity_threshold:
+            return "unknown", 0.0
+
+        scores_by_breed: dict[str, list[float]] = defaultdict(list)
+        for n in results:
+            scores_by_breed[n.breed].append(n.score)
+
+        breed = max(scores_by_breed, key=lambda b: sum(scores_by_breed[b]))
+        return breed, float(np.mean(scores_by_breed[breed]))
 
     # ------------------------------------------------------------------
     # Helpers de similitud provistos

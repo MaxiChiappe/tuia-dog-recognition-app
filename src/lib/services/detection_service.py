@@ -7,7 +7,10 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
+from ultralytics import YOLO
 
+from lib.preprocessing import preprocess_bgr
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
 
@@ -75,7 +78,27 @@ class DetectionService:
 
         Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
         """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        model = self._get_yolo()
+        # ultralytics asume BGR para arrays de numpy (convencion OpenCV): no se convierte a RGB.
+        result = model.predict(
+            image,
+            conf=self.conf_threshold,
+            classes=[self.dog_class_id],
+            verbose=False,
+        )[0]
+
+        detections: list[tuple[tuple[int, int, int, int], float]] = []
+        for box, conf in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()):
+            x1, y1, x2, y2 = (int(round(v)) for v in box)
+            detections.append(((x1, y1, x2, y2), float(conf)))
+        return detections
+
+    def _get_yolo(self) -> YOLO:
+        """Detector YOLO preentrenado en COCO, cargado una sola vez."""
+        if getattr(self, "_yolo", None) is None:
+            logger.info("Loading YOLO detector: %s", self.yolo_model_name)
+            self._yolo = YOLO(self.yolo_model_name)
+        return self._yolo
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
@@ -84,7 +107,13 @@ class DetectionService:
 
         El recorte llega en BGR (OpenCV). Retorna (raza, score).
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        model = self.classifier.get_torch_model()  # modelo activo, cacheado por load_model
+        tensor = preprocess_bgr(crop, self.classifier.image_size)  # mismo preprocesamiento
+        with torch.no_grad():
+            probs = torch.softmax(model(tensor), dim=1)[0]
+        score, idx = probs.max(dim=0)
+        # La lista de razas viaja dentro del modelo: indice -> nombre sin depender del dataset
+        return model.classes[int(idx)], float(score)
 
     # ------------------------------------------------------------------
     # Orquestacion provista
